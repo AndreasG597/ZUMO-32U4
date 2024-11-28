@@ -1,0 +1,517 @@
+#include <Wire.h> 
+#include <Zumo32U4.h> // Zumo32U4 library
+#include <IRremote.h> // IR-controller library
+
+uint16_t speed = 200; // Initial speed
+float balance = 500.0; // Initial 
+Zumo32U4Buzzer buzzer;
+Zumo32U4LineSensors lineSensors;
+Zumo32U4Motors motors;
+Zumo32U4ButtonA buttonA;
+Zumo32U4ButtonB buttonB;
+Zumo32U4OLED display;
+Zumo32U4Encoders encoders;
+// Zumo32U4ProximitySensors proxSensors;
+decode_results results;
+
+int16_t lastError = 0;
+#define NUM_SENSORS 5
+unsigned int lineSensorValues[NUM_SENSORS];
+
+uint8_t batteryPercent = 100;
+uint8_t batteryHealth = 100;
+int lastEncoderCount = 0;
+unsigned long lastStopTime = 0;
+bool lowBatteryWarningShown = false; 
+bool isBatteryEmpty = false;
+uint8_t previousBatteryPercent = 100;
+int pas = 0;
+
+unsigned long warningStartTime;
+const unsigned long warningDuration = 3000;
+bool warningActive = false; 
+
+bool isStopped = false;
+bool atIntersection = false;
+bool tollStationMessage = false;
+int tollStartTime;
+
+// Calibrate the linesensors
+void calibrateSensors() {
+    display.clear();
+    delay(1000);
+    for (uint16_t i = 0; i < 120; i++) {
+        if (i > 30 && i <= 90) {
+            motors.setSpeeds(-100, 100);
+        } else {
+            motors.setSpeeds(100, -100);
+        }
+        lineSensors.calibrate();
+    }
+    motors.setSpeeds(0, 0);
+}
+
+void updateBattery() {
+    int currentEncoderCount = encoders.getCountsLeft(); // Count the left encoder
+    int distanceTraveled = currentEncoderCount - lastEncoderCount;
+
+    // For every 5000 counts, reduce battery percentage based on the consumption rate
+    if (speed > 0 && distanceTraveled > 0) {
+        int consumptionRate = speed / 100;
+        if (distanceTraveled >= 5000) {
+            batteryPercent -= consumptionRate;
+            lastEncoderCount = currentEncoderCount;
+        }
+    }
+
+    // When the battery is empty, stop the car and play buzzer sound
+    if (batteryPercent == 0) {
+        isBatteryEmpty = true;
+        speed = 0;
+        motors.setSpeeds(0, 0);
+        buzzer.play("L16 cccc");
+        return;
+    }
+
+    // Make a sound when battery is at 50% and display a message
+    if (batteryPercent == 50 && !lowBatteryWarningShown && !warningActive) {
+        buzzer.play("L16 cccc");
+        lowBatteryWarningShown = true;
+        warningActive = true;
+        warningStartTime = millis();
+        display.clear();
+        display.gotoXY(0, 0);
+        display.print(F("Lavt batteri!"));
+        display.gotoXY(0, 1);
+        display.print(F("Dra til ladestasjon!"));
+    }
+
+    if (warningActive && millis() - warningStartTime >= warningDuration) {
+        warningActive = false;
+    }
+
+    // When battery is lower than 20%, stop every 5 seconds and display "Stop!"
+    if (batteryPercent <= 20) {
+        display.clear();
+        display.gotoXY(0, 0);
+        display.print(F("Veldig lavt batteri!"));
+        display.gotoXY(0, 2);
+        display.print(F("Batteri: "));
+        display.print(batteryPercent);
+        display.print(F("%"));
+        unsigned long currentTime = millis();
+        if (currentTime - lastStopTime >= 5000) {
+            motors.setSpeeds(0, 0);
+            display.clear();
+            display.gotoXY(0, 0);
+            display.print(F("Stop!"));
+            delay(1000);
+            lastStopTime = currentTime;
+        }
+    }
+}
+
+// When the intersection is detected and battery is lower than 30%, turn right to drive to the charging station
+void turnToChargingStation() { 
+    if (lineSensorValues[0] > 500 && lineSensorValues[4] > 500 && lineSensorValues[2] > 100 && batteryPercent <= 80) {
+        motors.setSpeeds(150, -150);
+        delay(600);
+        speed = 150; // slow speed set to make sure the car detects the charging station
+    }
+}
+
+
+// When charging station is detected, start charging
+void startCharging() {
+    if (lineSensorValues[0] > 500 && lineSensorValues[4] > 500 && lineSensorValues[2] < 100 && batteryPercent <= 80) {
+        speed = 0;
+        motors.setSpeeds(0 ,0);
+        charging();
+    }
+}
+
+
+// function that handles charging. Starts when charging station is detected in startCharging
+// Button B initiates fast charging, as long the balance is above 300 kr. If the balance is too low, show a message and go back to normal charging.
+// Fastcharging is 10x faster, but also 10x more expensive.
+// When fully charged, show a message and then the function ends
+void charging() {
+    uint16_t chargeInterval;
+    float costPerPercent;
+    String chargingType;
+    display.clear();
+    display.gotoXY(0, 0);
+    display.print(F("Velg lading:"));
+    display.gotoXY(0, 1);
+    display.print(F("A: Normal"));
+    display.gotoXY(0, 2);
+    display.print(F("B: Hurtig"));
+
+    // Vent til en knapp trykkes
+    while (!buttonA.isPressed() && !buttonB.isPressed()) {
+        // Do nothing, bare vent
+    }
+
+    // Sett opp ladeparametere basert på knappetrykk
+    if (buttonA.isPressed()) {
+        chargingType = "Lader";
+        chargeInterval = 2000;
+        costPerPercent = 0.5;
+    } 
+    else if (buttonB.isPressed()) {
+        if (balance >= 300) {
+            chargingType = "Hurtiglader";
+            chargeInterval = 200;
+            costPerPercent = 5;
+        } else {
+            display.clear();
+            display.gotoXY(0, 0);
+            display.print(F("For lav saldo"));
+            display.gotoXY(0, 1);
+            display.print(F("for hurtiglading"));
+            delay(1000);
+            return; 
+        }
+    }
+
+    unsigned long chargeStartTime = millis();
+    while (batteryPercent < 100) { // charge until the battery is full
+        if (millis() - chargeStartTime >= chargeInterval) {
+            if (balance <= 0) { // Deny or stop charging if balance is empty
+                display.clear();
+                display.gotoXY(0, 0);
+                display.print(F("Saldo tom!"));
+                display.gotoXY(0, 1);
+                display.print(F("Kan ikke lade mer."));
+                delay(1000);
+                break;
+            }
+
+            batteryPercent += 1;
+            balance -= costPerPercent;
+            chargeStartTime = millis();
+
+            display.clear();
+            display.gotoXY(0, 0);
+            display.print(chargingType);
+            display.gotoXY(0, 1);
+            display.print(F("Btr: "));
+            display.print(batteryPercent);
+            display.print(F("%"));
+            display.gotoXY(0, 2);
+            display.print(costPerPercent);
+            display.gotoXY(0, 3);
+            display.print(F("Saldo: "));
+            display.print(balance);
+        }
+
+        // These are repeated to allow switching between the two multiple times
+        if (buttonA.isPressed()) {
+            chargingType = "Lader";
+            chargeInterval = 2000;
+            costPerPercent = 0.5;
+        } else if (buttonB.isPressed()) {
+            if (balance >= 300) {
+                chargingType = "Hurtiglader";
+                chargeInterval = 200;
+                costPerPercent = 5;
+            } else {
+                display.clear();
+                display.gotoXY(0, 0);
+                display.print(F("For lav saldo"));
+                display.gotoXY(0, 1);
+                display.print(F("for hurtiglading"));
+                delay(1000);
+            }
+        }
+    }
+
+    isBatteryEmpty = (batteryPercent == 0);
+    lowBatteryWarningShown = false;
+    batteryHealth -= 1;
+    display.clear();
+    display.gotoXY(0, 0);
+    display.print(F("Batteri fullt!"));
+    display.gotoXY(0, 1);
+    display.print(F("Batteri-"));
+    display.gotoXY(0, 2);
+    display.print(F("%"));
+    display.gotoXY(0, 2);
+    display.print(batteryHealth);
+    display.print(F("%"));
+    delay(1000);
+    speed = 200;
+    motors.setSpeeds(speed, speed);
+}
+
+// Every time the car comes to an intersection, it stops and waits for an IR-signal that tells it what to do next
+void intersection() {
+    if (lineSensorValues[0] > 500 && lineSensorValues[4] > 500 && lineSensorValues[2] > 500) {
+        if (!atIntersection) { 
+            motors.setSpeeds(0, 0);
+            display.clear();
+            display.gotoXY(0, 0);
+            display.print(F("Ved kryss!"));
+            delay(500);
+        }
+    } 
+    else {
+        atIntersection = false; 
+    }
+}
+
+// Uber passenger is picked up
+void uber_passenger_on(){
+  display.clear();
+  display.gotoXY(0, 0);
+  display.print(F("Passasjer"));
+  display.gotoXY(0, 1);
+  display.print(F("plukket opp."));
+  delay(1000);
+  atIntersection = true;
+  speed = 200;
+  delay(500);
+}
+
+// Uber passenger is dropped off. Earns 200 kr
+void uber_passenger_off(){
+  display.clear();
+  display.gotoXY(0, 0);
+  display.print(F("Passasjer"));
+  display.gotoXY(0, 1);
+  display.print(F("går av."));
+  display.gotoXY(0, 2);
+  display.print(F("+ 200 kr"));
+  balance += 200;
+  atIntersection = true;
+  delay(1000);
+  speed = 200;
+}
+
+//light is green and there no customers to pick up, so the car keeps goes forward
+void greenLight_noPassenger(){
+  display.clear();
+  display.gotoXY(0, 0);
+  display.print(F("Green light"));
+  display.gotoXY(0, 1);
+  display.print(F("No"));
+  display.gotoXY(0, 2);
+  display.print(F("passenger."));
+  delay(1000);
+  atIntersection = true;
+  speed = 200;
+  delay(500);
+}
+
+// Light is red, car stops and waits randomly between 5 and 10 s for the light to turn green and then automatically starts driving
+void redLight(){
+  display.clear();
+  display.gotoXY(0, 0);
+  display.print(F("Rødt lys!"));
+  display.gotoXY(0, 1);
+  display.print(F("Vent..."));
+
+  uint16_t waitTime = random(5000, 10001);  // Randomly generated time between 5 and 10 seconds
+
+  unsigned long startTime = millis();
+  while (millis() - startTime < waitTime) {
+      // waits for the given time
+  }
+  atIntersection = true;
+  speed = 200; // starts driving with 200 speed
+}
+
+// when the car drives through the tollStation, it is charged 20 kr and shows a message for 1 s
+void tollStation() {
+  if (speed >= 1 && !tollStationMessage) {
+    balance -= 20;
+    display.clear();
+    display.gotoXY(0, 0);
+    display.print(F("Bom -20kr"));
+    tollStartTime = millis();
+    tollStationMessage = true;
+  }
+
+  if (tollStationMessage && (millis() - tollStartTime >= 1000)) {
+    display.clear();
+    tollStationMessage = false;
+  }
+}
+
+// To avoid flickering on the screen, only update when battery percentage, balance or speed is changed.
+void screen() {
+    bool displayNeedsUpdate = false;
+
+    if (batteryPercent != previousBatteryPercent) {
+        previousBatteryPercent = batteryPercent;
+        displayNeedsUpdate = true;
+    }
+
+    static float lastBalance = balance;
+    if (balance != lastBalance) {
+        lastBalance = balance;
+        displayNeedsUpdate = true;
+    }
+    
+    static int lastSpeed = speed;
+    if (speed != lastSpeed) {
+        lastSpeed = speed;
+        displayNeedsUpdate = true;
+    }
+
+    if (displayNeedsUpdate) {
+        display.clear();
+        display.gotoXY(0, 0);
+        display.print(F("Saldo:"));
+        display.gotoXY(0, 1);
+        display.print(balance);
+        display.gotoXY(0, 2);
+        display.print(F("Btr:"));
+        display.print(batteryPercent);
+        display.print(F("%"));
+        display.gotoXY(0, 3);
+        display.print(F("Fart:"));
+        display.print(speed);
+    }
+}
+
+// Speed control, if the car is driving faster than 250 speed and this is activated, the car is charged a 500 kr fine
+// plays a siren, to signal that the police is involved
+void policeControl(){
+  if(speed >= 250){
+    speed = 0;
+    motors.setSpeeds(0 ,0);
+    display.clear();
+    display.gotoXY(0, 0);
+    display.print(F("Police!"));
+    balance -= 500;
+    startSiren();
+    delay(1000);
+  }
+}
+
+void startSiren() {
+  unsigned long startTime = millis(); 
+  while (millis() - startTime < 3000) {
+    // Increasing frequency
+    for (int freq = 440; freq <= 880; freq += 20) {
+      if (millis() - startTime >= 3000) break;
+      buzzer.playFrequency(freq, 50, 15); 
+      delay(50);
+    }
+    // Decreasing frequency
+    for (int freq = 880; freq >= 440; freq -= 20) {
+      if (millis() - startTime >= 3000) break; 
+      buzzer.playFrequency(freq, 50, 15); 
+      delay(50);
+    }
+  }
+  buzzer.stopPlaying(); // Stop after 3 seconds
+}
+
+// makes the car follow the black line (road)
+void lineFollowing() {
+    if (isBatteryEmpty) {
+        motors.setSpeeds(0, 0);
+        return;
+    }
+
+    int16_t position = lineSensors.readLine(lineSensorValues);
+    int16_t error = position - 2000;
+    int16_t speedDifference = (error / 6) + 2 * (error - lastError);
+    lastError = error;
+
+    int16_t leftSpeed = (int16_t)speed + speedDifference;
+    int16_t rightSpeed = (int16_t)speed - speedDifference;
+
+    leftSpeed = constrain(leftSpeed, 0, (int16_t)speed);
+    rightSpeed = constrain(rightSpeed, 0, (int16_t)speed);
+
+    motors.setSpeeds(leftSpeed, rightSpeed);
+}
+
+// each case is connected to a button on the IR-controller
+void IR_commands(unsigned long command) {
+  switch (command) {
+    case 0xE916FF00: // Button 1
+      speed = 100;
+      break;
+    case 0xE619FF00: // Button 2
+      
+      speed = 200;
+      break;
+    case 0xF20DFF00: // Button 3
+    
+      speed = 300;
+      break;
+    case 0xF30CFF00: // Button 4
+
+      speed = 400;
+      break;
+    case 0xAD52FF00: // Button 0
+      speed = 0;
+      break;
+    case 0xE718FF00: // Button 5
+      uber_passenger_on();
+      break;
+    case 0xA15EFF00: // Button 6
+      uber_passenger_off();
+      break;
+    case 0xB946FF00: // Button ^
+      greenLight_noPassenger();
+      break;
+    case 0xBF40FF00: // Rødt lys
+      redLight();
+      break;
+    case 0xB54AFF00: // #
+      tollStation();
+      break;
+    case 0xA55AFF00: // Button 9
+      policeControl();
+      break;
+  }
+}
+
+void setup() {
+    IrReceiver.begin(A4, ENABLE_LED_FEEDBACK);
+    lineSensors.initFiveSensors();
+    buzzer.play(">g32>>c32");
+    display.setLayout11x4();
+    display.clear();
+    display.print(F("Press A"));
+    display.gotoXY(0, 1);
+    display.print(F("to "));
+    display.gotoXY(0, 2);
+    display.print(F("calibrate"));
+    buttonA.waitForButton();
+    calibrateSensors();
+    buzzer.play("L16 cdegreg4");
+    while (buzzer.isPlaying());
+    display.clear();
+    display.init();
+    encoders.init(); 
+    screen(); 
+}
+
+void loop() {
+    // expect IR-signals
+    if (IrReceiver.decode()) {
+        unsigned long signal = IrReceiver.decodedIRData.decodedRawData;
+        IrReceiver.resume();
+        IR_commands(signal);
+    }
+
+    // Only run these functions when car is moving
+    if (!isStopped) {
+        updateBattery();
+        turnToChargingStation();
+        startCharging();
+        lineFollowing();
+        intersection();
+    }
+    
+    screen();  // Screen is always being updated
+    if (isBatteryEmpty) {
+        return;
+    }
+}
